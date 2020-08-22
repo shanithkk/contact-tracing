@@ -1,7 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 use codec::alloc::string::ToString;
 use core::convert::TryInto;
-
+// use rstd::prelude::*;
+use sp_core::crypto::KeyTypeId;
+use system::offchain;
 use codec::{Encode, Decode};
 use frame_support::{
 	debug, decl_error, decl_event, decl_module, decl_storage, dispatch, ensure,
@@ -11,8 +13,13 @@ use frame_support::{
 		offchain::{
         self as rt_offchain,
         storage::StorageValueRef,
-        storage_lock::{StorageLock, Time},
+		storage_lock::{
+			StorageLock, Time
+		}
 		},
+		transaction_validity::{
+			TransactionValidity, TransactionLongevity, ValidTransaction, InvalidTransaction, TransactionPriority
+		  },
 		traits::{AtLeast32Bit, Bounded, Member, Hash},
 	},
 	traits::{Get, EnsureOrigin},
@@ -20,9 +27,18 @@ use frame_support::{
 		prelude::*,
 		str,
 		vec::Vec,
+		fmt,
 	},
 };
-use frame_system::{self as system, ensure_signed, offchain::SendTransactionTypes};
+use frame_system::{
+	self as system, ensure_signed, 
+	offchain::{
+		AppCrypto, CreateSignedTransaction, SendUnsignedTransaction, 
+		SignedPayload, SigningTypes, Signer, SubmitTransaction, 
+		SendTransactionTypes, SendSignedTransaction
+	}
+};
+
 use uuid::Uuid;
 
 
@@ -33,8 +49,27 @@ mod mock;
 mod tests;
 
 pub const LOCK_TIMEOUT_EXPIRATION: u64 = 3000; // in milli-seconds
+pub const KEY_TYPE: KeyTypeId = KeyTypeId(*b"ofcw");
 
 use exchangable_id::{ExchangableId,UUID, ExchangableIdProvider};
+
+pub mod crypto {
+	use super::KEY_TYPE;
+	use sp_runtime::{
+		app_crypto::{app_crypto, sr25519},
+		traits::Verify,
+		MultiSignature, MultiSigner,
+	};
+	use sp_core::sr25519::Signature as Sr25519Signature;
+	app_crypto!(sr25519, KEY_TYPE);
+
+	pub struct TestAuthId;
+	impl frame_system::offchain::AppCrypto<MultiSigner, MultiSignature> for TestAuthId {
+		type RuntimeAppPublic = Public;
+		type GenericSignature = sp_core::sr25519::Signature;
+		type GenericPublic = sp_core::sr25519::Public;
+	}
+}
 
 #[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
 pub struct Contact<T: Trait, Moment> {
@@ -57,71 +92,72 @@ pub struct Flag<T: Trait, Moment> {
 	pub timestamp: Moment,
 }
 
-pub trait Trait: system::Trait + timestamp::Trait + SendTransactionTypes<Call<Self>> {
+pub trait Trait: system::Trait + timestamp::Trait +  CreateSignedTransaction<Call<Self>> {
 	type Event: From<Event<Self>> + Into<<Self as frame_system::Trait>::Event>;
 	type ExchangableIdProvider: ExchangableIdProvider<Self>;
+	type AuthorityId: AppCrypto<Self::Public, Self::Signature>;
+	type Call: From<Call<Self>>;
+	type UnsignedPriority: Get<TransactionPriority>;
 }
+
+#[cfg_attr(feature = "std", derive(PartialEq, Eq, Debug))]
+#[derive(Encode, Decode)]
+pub enum OffchainRequest<T: system::Trait> {
+	// Ping(u8,  <T as system::Trait>::AccountId),
+	FlagID(ExchangableId<T>),
+	AddToUUIDPool(UUID),
+}
+
 
 decl_storage! {
 	trait Store for Module<T: Trait> as ContactTracing {
 		pub Contacts get(fn contacts): double_map hasher(blake2_128_concat) ExchangableId<T>, hasher(blake2_128_concat) ExchangableId<T> => Option<Contact<T, T::Moment>>;
 		pub Flags get(fn flags): map hasher(blake2_128_concat) ExchangableId<T> => Option<Flag<T, T::Moment>>;
-        // pub EventCount get(fn event_count): u128 = 0;
-        // // pub AllEvents get(fn event_by_idx): map hasher(blake2_128_concat) ContactEventIndex => Option<ContactEvent<T::Moment>>;
-        // // pub EventsOfShipment get(fn events_of_shipment): map hasher(blake2_128_concat) ShipmentId => Vec<ShippingEventIndex>;
-
-        // // // Off-chain Worker notifications
-		// // pub OcwNotifications get (fn ocw_notifications): map hasher(identity) T::BlockNumber => Vec<ShippingEventIndex>;
-		
-		// // Contact uid, id, timestamp
-
-		Something get(fn something): Option<u32>;
+		OffchainRequests get(fn offchain_requests): Vec<OffchainRequest<T>>;
 	}
 }
 
-// Pallets use events to inform users when important changes are made.
-// https://substrate.dev/docs/en/knowledgebase/runtime/events
 decl_event!(
 	pub enum Event<T> where 
-		AccountId = <T as frame_system::Trait>::AccountId,
+		//AccountId = <T as frame_system::Trait>::AccountId,
 		UUID = Vec<u8>,
 		ExchangableId = <T as system::Trait>::Hash,
 		FlagType = FlagType,
 	{
-		/// Event documentation should end with an array that provides descriptive names for event
-		/// parameters. [something, who]
 		ContactAdded(ExchangableId),
 		ContactFlagged(UUID, FlagType),
-		SomethingStored(u32, AccountId),
 	}
 );
 
-// Errors inform users that something went wrong.
 decl_error! {
 	pub enum Error for Module<T: Trait> {
 		/// Error names should be descriptive.
 		NotOwner,
 		InvalidUUID,
 		NoneValue,
-		/// Errors should have helpful documentation associated with them.
 		StorageOverflow,
 	}
 }
 
-// Dispatchable functions allows users to interact with the pallet and invoke state changes.
-// These functions materialize as "extrinsics", which are often compared to transactions.
-// Dispatchable functions must be annotated with a weight and must return a DispatchResult.
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-		// Errors must be initialized if they are used by the pallet.
 		type Error = Error<T>;
-
-		// Events must be initialized if they are used by the pallet.
 		fn deposit_event() = default;
 
-		/// An example dispatchable that takes a singles value as a parameter, writes the value to
-		/// storage and emits an event. This function must be dispatched by a signed extrinsic.
-		/// 
+		#[weight = 0]
+		pub fn generate_uuid(origin, id: ExchangableId<T>) {
+			let sender = ensure_signed(origin)?;
+			// ensure!(
+			// 	T::ExchangableIdProvider::check_uuid_exists(&id),
+			// 	Error::<T>::InvalidUUID,
+			// );
+			// Implement Check owner
+			let uuid = T::ExchangableIdProvider::get_uuid(id);
+			<Self as Store>::OffchainRequests::mutate(|v| v.push(OffchainRequest::AddToUUIDPool(uuid.unwrap())));
+
+			
+		}
+
 		#[weight = 0]
 		pub fn add_contact(origin, id: UUID, contact_id: UUID) {
 			let sender = ensure_signed(origin)?;
@@ -136,7 +172,13 @@ decl_module! {
 			let id = T::Hashing::hash_of(&Uuid::parse_str(str::from_utf8(&id).unwrap()).unwrap().as_bytes());
 			let contact_id = T::Hashing::hash_of(&Uuid::parse_str(str::from_utf8(&contact_id).unwrap()).unwrap().as_bytes());
 			let contact = Self::new_contact(id, contact_id);
-
+			// let uuid = T::ExchangableIdProvider::get_uuid(id);
+			if Self::check_contact_flag(contact_id) {
+				<Self as Store>::OffchainRequests::mutate(|v| v.push(OffchainRequest::FlagID(id)));
+			} 
+			//check if added contact is corona positive
+			
+			//ensure!();
 			// Self::deposit_event(RawEvent::ContactAdded(contact.id));
 		}
 
@@ -161,48 +203,9 @@ decl_module! {
 			
 			let flag_type_event = flag_type.clone();
 			Self::new_flag(id, flag_type);
+			//
 			let uuid = T::ExchangableIdProvider::get_uuid(id);
 			Self::deposit_event(RawEvent::ContactFlagged(uuid.unwrap(), flag_type_event));
-		}
-
-		#[weight = 0]
-		pub fn check_flag(origin, id: UUID) {
-
-		}
-
-		// #[weight = 10_000 + T::DbWeight::get().writes(1)]
-		// pub fn do_something(origin, something: u32) -> dispatch::DispatchResult {
-		// 	// Check that the extrinsic was signed and get the signer.
-		// 	// This function will return an error if the extrinsic is not signed.
-		// 	// https://substrate.dev/docs/en/knowledgebase/runtime/origin
-		// 	let who = ensure_signed(origin)?;
-
-		// 	// Update storage.
-		// 	Something::put(something);
-
-		// 	// Emit an event.
-		// 	Self::deposit_event(RawEvent::SomethingStored(something, who));
-		// 	// Return a successful DispatchResult
-		// 	Ok(())
-		// }
-
-		/// An example dispatchable that may throw a custom error.
-		#[weight = 10_000 + T::DbWeight::get().reads_writes(1,1)]
-		pub fn cause_error(origin) -> dispatch::DispatchResult {
-			let _who = ensure_signed(origin)?;
-
-			// Read a value from storage.
-			match Something::get() {
-				// Return an error if the value has not been set.
-				None => Err(Error::<T>::NoneValue)?,
-				Some(old) => {
-					// Increment the value read from storage; will error in the event of overflow.
-					let new = old.checked_add(1).ok_or(Error::<T>::StorageOverflow)?;
-					// Update the value in storage with the incremented result.
-					Something::put(new);
-					Ok(())
-				},
-			}
 		}
 
 		fn offchain_worker(block_number: T::BlockNumber) {
@@ -228,6 +231,18 @@ decl_module! {
 
 impl<T: Trait> Module<T> {
 
+	fn check_contact_flag(id: ExchangableId<T>) -> bool {
+		match Flags::<T>::get(id) {
+			None => false,
+			Some(flag) => if flag.flag_type == Some(FlagType::Positive) || flag.flag_type == Some(FlagType::Suspicious) {
+				true
+			} else { false },
+		}
+		// let flag = Flags::<T>::get(id);
+		// debug::info!("{:?}", flag);
+
+	}
+
 	fn new_contact(id: ExchangableId<T>, contact_id: ExchangableId<T>) -> Contact<T, T::Moment>{
 		let contact = Contact::<T, T::Moment> {
 			id: id,
@@ -246,6 +261,13 @@ impl<T: Trait> Module<T> {
 		};
 		Flags::insert(id,&flag);
 	}
+	fn check_flag(id: ExchangableId<T>){
+		debug::info!("{:?}", id);
+	}
+
+	fn flag_id(id: ExchangableId<T>) {
+
+	}
 
 	pub fn check_exchangable_id_exists(props: &ExchangableId<T>) -> Result<(), Error<T>> {
         // ensure!(
@@ -256,7 +278,8 @@ impl<T: Trait> Module<T> {
     }
 	
 	fn process_ocw_notifications(block_number: T::BlockNumber) {
-		let last_processed_block_ref = StorageValueRef::persistent(b"contact_tracing_ocw::last_proccessed_block");
+		let key = "contact_tracing".to_string() + "_ocw" + "::last_proccessed_block";	
+		let last_processed_block_ref = StorageValueRef::persistent(key.as_bytes());
 		let mut last_processed_block: u32 = match last_processed_block_ref.get::<T::BlockNumber>() {
 			Some(Some(last_proccessed_block)) if last_proccessed_block >= block_number => {
 				debug::info!(
@@ -277,7 +300,21 @@ impl<T: Trait> Module<T> {
 		
 		let start_block = last_processed_block + 1;
 		let end_block = block_number.try_into().ok().unwrap() as u32;
+		// debug::info!(" start_block => {} end_block => {}", start_block, end_block);
 		for current_block in start_block..end_block {
+			debug::info!(" start_block => {} end_block => {}", start_block, end_block);
+			for e in <Self as Store>::OffchainRequests::get() {
+				match e {
+					OffchainRequest::FlagID(id) => {
+						Self::flag_id(id);
+					}
+					OffchainRequest::AddToUUIDPool(id) => {
+						debug::info!(" start_block => {:?}", id);
+						//Self::add_uuid_pool
+					}
+					// there would be potential other calls
+				}
+			}
 			debug::debug!(
 				"[contact_tracing_ocw] Processing notifications for block {}",
 				current_block
@@ -298,6 +335,14 @@ impl<T: Trait> Module<T> {
 			// }
 			last_processed_block = current_block;
 		}
+
+		if last_processed_block >= start_block {
+            last_processed_block_ref.set(&last_processed_block);
+            debug::info!(
+                "[contact_tracing_ocw] Notifications successfully processed up to block {}",
+                last_processed_block
+            );
+        }
 	}
 }
 
