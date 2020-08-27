@@ -31,7 +31,7 @@ use frame_support::{
 	},
 };
 use frame_system::{
-	self as system, ensure_signed, 
+	self as system, ensure_signed, ensure_none,
 	offchain::{
 		AppCrypto, CreateSignedTransaction, SendUnsignedTransaction, 
 		SignedPayload, SigningTypes, Signer, SubmitTransaction, 
@@ -106,14 +106,16 @@ pub enum OffchainRequest<T: system::Trait> {
 	// Ping(u8,  <T as system::Trait>::AccountId),
 	FlagID(ExchangableId<T>),
 	AddToUUIDPool(UUID),
+	Idle(),
 }
 
 
 decl_storage! {
 	trait Store for Module<T: Trait> as ContactTracing {
+		pub UUIDPool get(fn uuid_pool): map hasher(blake2_128_concat) T::AccountId => Option<Vec<UUID>>;
 		pub Contacts get(fn contacts): double_map hasher(blake2_128_concat) ExchangableId<T>, hasher(blake2_128_concat) ExchangableId<T> => Option<Contact<T, T::Moment>>;
 		pub Flags get(fn flags): map hasher(blake2_128_concat) ExchangableId<T> => Option<Flag<T, T::Moment>>;
-		OffchainRequests get(fn offchain_requests): Vec<OffchainRequest<T>>;
+		OffchainRequests get(fn offchain_requests): Option<OffchainRequest<T>>;
 	}
 }
 
@@ -131,7 +133,6 @@ decl_event!(
 
 decl_error! {
 	pub enum Error for Module<T: Trait> {
-		/// Error names should be descriptive.
 		NotOwner,
 		InvalidUUID,
 		NoneValue,
@@ -145,17 +146,11 @@ decl_module! {
 		fn deposit_event() = default;
 
 		#[weight = 0]
-		pub fn generate_uuid(origin, id: ExchangableId<T>) {
+		pub fn add_id_pool(origin, id: ExchangableId<T>) {
 			let sender = ensure_signed(origin)?;
-			// ensure!(
-			// 	T::ExchangableIdProvider::check_uuid_exists(&id),
-			// 	Error::<T>::InvalidUUID,
-			// );
 			// Implement Check owner
 			let uuid = T::ExchangableIdProvider::get_uuid(id);
-			<Self as Store>::OffchainRequests::mutate(|v| v.push(OffchainRequest::AddToUUIDPool(uuid.unwrap())));
-
-			
+			<Self as Store>::OffchainRequests::mutate(|v| *v = Some(OffchainRequest::<T>::AddToUUIDPool(uuid.unwrap())));	
 		}
 
 		#[weight = 0]
@@ -174,12 +169,20 @@ decl_module! {
 			let contact = Self::new_contact(id, contact_id);
 			// let uuid = T::ExchangableIdProvider::get_uuid(id);
 			if Self::check_contact_flag(contact_id) {
-				<Self as Store>::OffchainRequests::mutate(|v| v.push(OffchainRequest::FlagID(id)));
+				<Self as Store>::OffchainRequests::mutate(|_| OffchainRequest::<T>::FlagID(id));
 			} 
 			//check if added contact is corona positive
 			
 			//ensure!();
 			// Self::deposit_event(RawEvent::ContactAdded(contact.id));
+		}
+
+		#[weight = 0]
+		pub fn get_uuid_pool(origin){
+			let sender = ensure_none(origin)?;
+			debug::info!("{:?}", sender);
+			//ensure if any uuids available
+
 		}
 
 		#[weight = 0]
@@ -238,9 +241,40 @@ impl<T: Trait> Module<T> {
 				true
 			} else { false },
 		}
-		// let flag = Flags::<T>::get(id);
-		// debug::info!("{:?}", flag);
-
+	}
+	fn fetch_uuid_pool() -> UUID {
+		let uuid_pool_ref = StorageValueRef::persistent(b"contact_tracing_ocw::uuid_pool");
+		let mut uuid: UUID =  Vec::new();
+		uuid_pool_ref.mutate::<Vec<UUID>, (), _>(|v : Option<Option<Vec<UUID>>>| {
+			match v 
+				{
+					None => Ok(vec![]),
+					Some(v) => {
+					let mut v = v.unwrap();
+					uuid = v.pop().clone().unwrap();
+					Ok(v)
+				}
+			}
+		});
+		uuid
+	}
+	fn add_uuid_pool(id: UUID, block_number: u32) {
+		let uuid_pool_ref = StorageValueRef::persistent(b"contact_tracing_ocw::uuid_pool");
+		uuid_pool_ref.mutate::<Vec<UUID>, (), _>(|v : Option<Option<Vec<UUID>>>| {
+			match v 
+				{
+					None => Ok(vec![]),
+					Some(v) => {
+					let mut v = v.unwrap();
+					if !v.iter().any(|i| *i == id) {
+						v.push(id);
+					}
+					Ok(v)
+				}
+			}
+		});
+		let mut uuid_pool = uuid_pool_ref.get::<Vec<UUID>>();
+		debug::info!("<=====> {:?}", uuid_pool);
 	}
 
 	fn new_contact(id: ExchangableId<T>, contact_id: ExchangableId<T>) -> Contact<T, T::Moment>{
@@ -270,10 +304,7 @@ impl<T: Trait> Module<T> {
 	}
 
 	pub fn check_exchangable_id_exists(props: &ExchangableId<T>) -> Result<(), Error<T>> {
-        // ensure!(
-        //     props.len() <= SHIPMENT_MAX_PRODUCTS,
-        //     Error::<T>::ShipmentHasTooManyProducts,
-        // );
+        // ensure!();
         Ok(())
     }
 	
@@ -291,7 +322,7 @@ impl<T: Trait> Module<T> {
 			Some(Some(last_proccessed_block)) => {
 				last_proccessed_block.try_into().ok().unwrap() as u32
 			}
-			None => 0, //TODO: define a OCW_MAX_BACKTRACK_PERIOD param
+			None => 0,
 			_ => 	{
 				debug::error!("[contact_tracing_ocw] Error reading contact_tracing_ocw::last_proccessed_block.");
 				return;
@@ -300,39 +331,25 @@ impl<T: Trait> Module<T> {
 		
 		let start_block = last_processed_block + 1;
 		let end_block = block_number.try_into().ok().unwrap() as u32;
-		// debug::info!(" start_block => {} end_block => {}", start_block, end_block);
 		for current_block in start_block..end_block {
+			let offchain_requests = <Self as Store>::OffchainRequests::get();
 			debug::info!(" start_block => {} end_block => {}", start_block, end_block);
-			for e in <Self as Store>::OffchainRequests::get() {
-				match e {
+				match if offchain_requests.is_some() { offchain_requests.unwrap() } else { OffchainRequest::Idle() } {
 					OffchainRequest::FlagID(id) => {
 						Self::flag_id(id);
 					}
 					OffchainRequest::AddToUUIDPool(id) => {
-						debug::info!(" start_block => {:?}", id);
-						//Self::add_uuid_pool
+						Self::add_uuid_pool(id, current_block);
+					}
+					OffchainRequest::Idle() => {
+						debug::info!("offchain worker idle");
 					}
 					// there would be potential other calls
 				}
-			}
 			debug::debug!(
 				"[contact_tracing_ocw] Processing notifications for block {}",
 				current_block
 			);
-			// let ev_indices = Self::ocw_notifications::<T::BlockNumber>(current_block.into());
-
-			// let listener_results: Result<Vec<_>, _> = ev_indices
-			// 	.iter()
-			// 	.map(|idx| match Self::event_by_idx(idx) {
-			// 		Some(ev) => Self::notify_listener(&ev),
-			// 		None => Ok(()),
-			// 	})
-			// 	.collect();
-
-			// if let Err(err) = listener_results {
-			// 	debug::warn!("[contact_tracing_ocw] notify_listener error: {}", err);
-			// 	break;
-			// }
 			last_processed_block = current_block;
 		}
 
@@ -346,40 +363,3 @@ impl<T: Trait> Module<T> {
 	}
 }
 
-// #[derive(Default)]
-// pub struct ContactBuilder<T: Trait, Moment>
-// where
-// {
-//     id: Option<ExchangableId<T>>,
-//     contact_id: Option<ExchangableId<T>>,
-//     timestamp: Moment,
-// }
-
-// impl<T: Trait, Moment> ContactBuilder<T, Moment>
-// where
-// {
-// 	pub fn add_id(mut self, id: ExchangableId<T>)-> Self {
-//         self.id = id;
-//         self
-// 	}
-	
-// 	pub fn add_contact_id(mut self, contact_id: ExchangableId<T>)-> Self {
-//         self.contact_id = contact_id;
-//         self
-//     }
-
-// 	pub fn add_timestamp(mut self, timestamp: Moment) -> Self {
-//         self.timestamp = timestamp;
-//         self
-//     }
-
-// 	pub fn build(self) -> Contact<T, Moment> {
-//         Contact::<T, Moment> {
-//             id: self.id,
-//             contact_id: self.contact_id,
-//             timestamp: self.timestamp,
-//         }
-// 	}
-	
-
-// }
