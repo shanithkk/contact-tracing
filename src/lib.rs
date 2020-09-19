@@ -4,6 +4,7 @@ use core::convert::TryInto;
 // use rstd::prelude::*;
 use sp_core::crypto::KeyTypeId;
 use system::offchain;
+
 use codec::{Encode, Decode};
 use frame_support::{
 	debug, decl_error, decl_event, decl_module, decl_storage, dispatch, ensure,
@@ -29,9 +30,10 @@ use frame_support::{
 		vec::Vec,
 		fmt,
 	},
+	unsigned::TransactionSource,
 };
 use frame_system::{
-	self as system, ensure_signed, ensure_none,
+	self as system, ensure_signed, ensure_none, 
 	offchain::{
 		AppCrypto, CreateSignedTransaction, SendUnsignedTransaction, 
 		SignedPayload, SigningTypes, Signer, SubmitTransaction, 
@@ -98,6 +100,9 @@ pub trait Trait: system::Trait + timestamp::Trait +  CreateSignedTransaction<Cal
 	type AuthorityId: AppCrypto<Self::Public, Self::Signature>;
 	type Call: From<Call<Self>>;
 	type UnsignedPriority: Get<TransactionPriority>;
+	//--------------offchain----------------------
+	// type SubmitSignedTransaction: offchain::SubmitSignedTransaction<Self, <Self as Trait>::Call>;
+	//type SubmitUnsignedTransaction: offchain::SubmitUnsignedTransaction<Self, <Self as Trait>::Call>;
 }
 
 #[cfg_attr(feature = "std", derive(PartialEq, Eq, Debug))]
@@ -106,6 +111,7 @@ pub enum OffchainRequest<T: system::Trait> {
 	// Ping(u8,  <T as system::Trait>::AccountId),
 	FlagID(ExchangableId<T>),
 	AddToUUIDPool(UUID),
+	Addunsignedtransaction(),
 	Idle(),
 }
 
@@ -116,6 +122,7 @@ decl_storage! {
 		pub Contacts get(fn contacts): double_map hasher(blake2_128_concat) ExchangableId<T>, hasher(blake2_128_concat) ExchangableId<T> => Option<Contact<T, T::Moment>>;
 		pub Flags get(fn flags): map hasher(blake2_128_concat) ExchangableId<T> => Option<Flag<T, T::Moment>>;
 		OffchainRequests get(fn offchain_requests): Option<OffchainRequest<T>>;
+		pub FlagCount get(fn flagcount): u128 =0;
 	}
 }
 
@@ -137,6 +144,7 @@ decl_error! {
 		InvalidUUID,
 		NoneValue,
 		StorageOverflow,
+		OffchainUnsignedTxError,
 	}
 }
 
@@ -182,6 +190,14 @@ decl_module! {
 			let sender = ensure_none(origin)?;
 			debug::info!("{:?}", sender);
 			//ensure if any uuids available
+
+		}
+
+		#[weight = 0]
+		pub fn get_count(origin){
+			let sender = ensure_none(origin)?;
+			debug::info!("{:?}", Self::flagcount());
+			
 
 		}
 
@@ -233,6 +249,10 @@ decl_module! {
 }
 
 impl<T: Trait> Module<T> {
+
+	fn totalcount()->u128{
+		Self::totalcount()
+	}
 
 	fn check_contact_flag(id: ExchangableId<T>) -> bool {
 		match Flags::<T>::get(id) {
@@ -302,6 +322,22 @@ impl<T: Trait> Module<T> {
 	fn flag_id(id: ExchangableId<T>) {
 
 	}
+	fn add_unsignedtransation(){
+		debug::info!("somethinf added");
+	}
+	
+	fn offchain_unsigned_tx(block_number: T::BlockNumber) -> Result<(), Error<T>> {
+		let number: u64 = block_number.try_into().unwrap_or(0) as u64;
+		let call = Call::submit_number_unsigned(number);
+	
+		// `submit_unsigned_transaction` returns a type of `Result<(), ()>`
+		//   ref: https://substrate.dev/rustdocs/v2.0.0-rc6/frame_system/offchain/struct.SubmitTransaction.html#method.submit_unsigned_transaction
+		SubmitTransaction::<T, Call<T>>::submit_unsigned_transaction(call.into())
+			.map_err(|_| {
+				debug::error!("Failed in offchain_unsigned_tx");
+				<Error<T>>::OffchainUnsignedTxError
+			})
+	}
 
 	pub fn check_exchangable_id_exists(props: &ExchangableId<T>) -> Result<(), Error<T>> {
         // ensure!();
@@ -337,12 +373,16 @@ impl<T: Trait> Module<T> {
 				match if offchain_requests.is_some() { offchain_requests.unwrap() } else { OffchainRequest::Idle() } {
 					OffchainRequest::FlagID(id) => {
 						Self::flag_id(id);
+						FlagCount::mutate(|total| *total += 1);
 					}
 					OffchainRequest::AddToUUIDPool(id) => {
 						Self::add_uuid_pool(id, current_block);
 					}
 					OffchainRequest::Idle() => {
 						debug::info!("offchain worker idle");
+					}
+					OffchainRequest::Addunsignedtransaction()=>{
+						Self::add_unsignedtransation();
 					}
 					// there would be potential other calls
 				}
@@ -363,3 +403,21 @@ impl<T: Trait> Module<T> {
 	}
 }
 
+impl<T: Trait> frame_support::unsigned::ValidateUnsigned for Module<T> {
+    type Call = Call<T>;
+
+    fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
+        let valid_tx = |provide| ValidTransaction::with_tag_prefix("contact_tracing_ocw")
+            .priority(T::UnsignedPriority::get())
+            .and_provides([&provide])
+            .longevity(3)
+            .propagate(true)
+            .build();
+
+        match call {
+            Call::submit_number_unsigned(_number) => valid_tx(b"submit_number_unsigned".to_vec()),
+            // -- snip --
+            _ => InvalidTransaction::Call.into(),
+        }
+    }
+}
